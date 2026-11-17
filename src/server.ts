@@ -1,90 +1,51 @@
 import "dotenv/config";
-import express, { Request, Response } from "express";
-import { randomUUID } from "node:crypto";
+import { createApp } from "./app";
 import {
   closeDatabaseConnection,
   connectToDatabase,
-  getMessagesCollection,
-  Message,
   sanitizeDbError,
 } from "./db";
 
-const app = express();
 const PORT = Number(process.env.PORT) || 3000;
 
-app.use(express.json());
+function parseAllowedOrigins(port: number): string[] {
+  const configured = (process.env.CLIENT_ORIGIN || "http://localhost:5173")
+    .split(",")
+    .map((origin) => origin.trim())
+    .filter(Boolean);
 
-// GET /messages - return all stored messages oldest first with a deterministic tie-breaker
-app.get("/messages", async (_req: Request, res: Response) => {
-  try {
-    const collection = getMessagesCollection();
-    const docs = await collection
-      .find({}, { projection: { _id: 0, id: 1, text: 1, createdAt: 1 } })
-      .sort({ createdAt: 1, id: 1 })
-      .toArray();
-
-    res.json(docs);
-  } catch (err) {
-    console.error("Failed to fetch messages:", sanitizeDbError(err));
-    res.status(500).json({
-      error: "Database error: Unable to retrieve messages.",
-    });
-  }
-});
-
-// POST /messages - validate, persist in MongoDB, and return 201 after acknowledgment
-app.post("/messages", async (req: Request, res: Response) => {
-  const rawText = req.body?.text;
-
-  if (typeof rawText !== "string") {
-    res.status(400).json({
-      error: "Invalid input: 'text' field is required and must be a string.",
-    });
-    return;
-  }
-
-  const text = rawText.trim();
-
-  if (!text) {
-    res.status(400).json({
-      error: "Invalid input: 'text' cannot be empty or blank.",
-    });
-    return;
-  }
-
-  const newMessage: Message = {
-    id: randomUUID(),
-    text,
-    createdAt: new Date().toISOString(),
-  };
-
-  try {
-    const collection = getMessagesCollection();
-    const result = await collection.insertOne(
-      { ...newMessage },
-      { writeConcern: { w: 1 } }
-    );
-
-    if (!result.acknowledged) {
-      res.status(500).json({
-        error: "Database error: Message write was not acknowledged.",
-      });
-      return;
-    }
-
-    res.status(201).json(newMessage);
-  } catch (err) {
-    console.error("Failed to insert message:", sanitizeDbError(err));
-    res.status(500).json({
-      error: "Database error: Unable to save message.",
-    });
-  }
-});
+  return Array.from(
+    new Set([
+      ...configured,
+      `http://localhost:${port}`,
+      `http://127.0.0.1:${port}`,
+    ])
+  );
+}
 
 async function startServer(): Promise<void> {
+  const sessionSecret = process.env.SESSION_SECRET?.trim();
+  if (!sessionSecret) {
+    console.error(
+      "Startup failed: SESSION_SECRET environment variable is required."
+    );
+    process.exit(1);
+  }
+
+  const sessionTtlMs =
+    Number(process.env.SESSION_TTL_MS) || 7 * 24 * 60 * 60 * 1000;
+  const authRateLimitMax = Number(process.env.AUTH_RATE_LIMIT_MAX) || 20;
+
   try {
     await connectToDatabase();
     console.log("Connected to MongoDB and verified database ping.");
+
+    const app = createApp({
+      sessionSecret,
+      sessionTtlMs,
+      allowedOrigins: parseAllowedOrigins(PORT),
+      authRateLimitMax,
+    });
 
     const server = app.listen(PORT, () => {
       console.log(`Server is running at http://localhost:${PORT}`);
